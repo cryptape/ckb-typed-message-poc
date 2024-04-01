@@ -355,7 +355,7 @@ const ERROR_FLOW: i8 = 118;
 const ERROR_WRONG_OTX: i8 = 120;
 const ERROR_MOL2_UNEXPECTED: i8 = 123;
 
-pub fn _assert_script_error(err: ckb_error::Error, err_code: i8) {
+pub fn assert_script_error(err: ckb_error::Error, err_code: i8) {
     let error_string = err.to_string();
     assert!(
         error_string.contains(format!("error code {}", err_code).as_str()),
@@ -997,7 +997,13 @@ fn generate_otx_a5_fail(dl: &mut Resource, px: &mut Pickaxer) -> ckb_types::core
 }
 
 fn assemble_otx(otxs: Vec<ckb_types::core::TransactionView>) -> ckb_types::core::TransactionView {
-    let tx_builder = ckb_types::core::TransactionBuilder::default();
+    assemble_otx_with_txbuilder(otxs, ckb_types::core::TransactionBuilder::default()).build()
+}
+
+fn assemble_otx_with_txbuilder(
+    otxs: Vec<ckb_types::core::TransactionView>,
+    tx_builder: ckb_types::core::TransactionBuilder,
+) -> ckb_types::core::TransactionBuilder {
     let os = schemas::basic::OtxStart::new_builder().build();
     let wl = schemas::top_level::WitnessLayout::new_builder()
         .set(os)
@@ -1024,7 +1030,7 @@ fn assemble_otx(otxs: Vec<ckb_types::core::TransactionView>) -> ckb_types::core:
         }
     }
 
-    tx_builder.build()
+    tx_builder
 }
 
 fn merge_bytesvec<T1: IntoIterator, T2: Clone + From<<T1 as IntoIterator>::Item>>(
@@ -1058,11 +1064,17 @@ fn test_cobuild_otx_simple() {
     let tx = assemble_otx(vec![generate_otx_a0(&mut dl, &mut px)]);
     let tx = ckb_types::core::cell::resolve_transaction(tx, &mut HashSet::new(), &dl, &dl).unwrap();
     let verifier = Verifier::default();
-    verifier.verify(&tx, &dl).unwrap();
+
+    const CONSUME_CYCLES: u64 = 3430000;
+    let cycles = verifier.verify(&tx, &dl).unwrap();
+    println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 150000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
 }
 
-#[test]
-fn test_cobuild_otx_prefix() {
+fn new_otx_prefix_tx() -> (ckb_types::core::TransactionView, Resource) {
     let mut dl = Resource::default();
     let mut px = Pickaxer::default();
     let tx_builder = ckb_types::core::TransactionBuilder::default();
@@ -1086,41 +1098,32 @@ fn test_cobuild_otx_prefix() {
     let tx_builder = tx_builder.output_data(Vec::new().pack());
     let tx_builder = tx_builder.witness(vec![0x00; 102].pack());
 
-    // Append otx
-    let os = schemas::basic::OtxStart::new_builder()
-        .start_cell_deps(2u32.pack())
-        .start_header_deps(0u32.pack())
-        .start_input_cell(1u32.pack())
-        .start_output_cell(1u32.pack())
-        .build();
-    let wl = schemas::top_level::WitnessLayout::new_builder()
-        .set(os)
-        .build();
-    let mut tx_builder = tx_builder.witness(wl.as_bytes().pack());
-    let otxs = vec![
-        generate_otx_a0(&mut dl, &mut px),
-        generate_otx_b0(&mut dl, &mut px),
-    ];
-    for otx in otxs {
-        for e in otx.cell_deps_iter() {
-            tx_builder = tx_builder.cell_dep(e);
-        }
-        for e in otx.header_deps_iter() {
-            tx_builder = tx_builder.header_dep(e);
-        }
-        for e in otx.inputs().into_iter() {
-            tx_builder = tx_builder.input(e);
-        }
-        for e in otx.outputs().into_iter() {
-            tx_builder = tx_builder.output(e);
-        }
-        for e in otx.outputs_data().into_iter() {
-            tx_builder = tx_builder.output_data(e);
-        }
-        for e in otx.witnesses().into_iter() {
-            tx_builder = tx_builder.witness(e);
-        }
-    }
+    let tx_builder = assemble_otx_with_txbuilder(
+        vec![
+            generate_otx_a0(&mut dl, &mut px),
+            generate_otx_b0(&mut dl, &mut px),
+        ],
+        tx_builder,
+    );
+
+    let tx_builder = {
+        let tx = tx_builder.build();
+        let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> =
+            tx.witnesses().into_iter().collect();
+        // Append otx
+        let os = schemas::basic::OtxStart::new_builder()
+            .start_cell_deps(2u32.pack())
+            .start_header_deps(0u32.pack())
+            .start_input_cell(1u32.pack())
+            .start_output_cell(1u32.pack())
+            .build();
+        let wl = schemas::top_level::WitnessLayout::new_builder()
+            .set(os)
+            .build();
+        ws[1] = wl.as_bytes().pack(); // Replace OtxStart
+
+        tx.as_advanced_builder().set_witnesses(ws)
+    };
 
     // Create sign for prefix
     let sign_message =
@@ -1141,9 +1144,54 @@ fn test_cobuild_otx_prefix() {
     let tx_builder = tx_builder.set_witnesses(wb.build().into_iter().collect());
 
     let tx = tx_builder.build();
+
+    (tx, dl)
+}
+
+#[test]
+fn test_cobuild_otx_prefix() {
+    let (tx, dl) = new_otx_prefix_tx();
     let tx = ckb_types::core::cell::resolve_transaction(tx, &mut HashSet::new(), &dl, &dl).unwrap();
     let verifier = Verifier::default();
-    verifier.verify(&tx, &dl).unwrap();
+
+    const CONSUME_CYCLES: u64 = 10540000;
+    let cycles = verifier.verify(&tx, &dl).unwrap();
+    println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 150000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
+}
+
+#[test]
+fn test_cobuild_otx_prefix_no_sign() {
+    let (tx, dl) = new_otx_prefix_tx();
+    let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> = tx.witnesses().into_iter().collect();
+    ws.remove(0);
+    let tx = tx.as_advanced_builder().set_witnesses(ws).build();
+
+    let tx = ckb_types::core::cell::resolve_transaction(tx, &mut HashSet::new(), &dl, &dl).unwrap();
+    let verifier = Verifier::default();
+    let err = verifier.verify(&tx, &dl).unwrap_err();
+    assert_script_error(err, 4);
+}
+
+#[test]
+fn test_cobuild_otx_prefix_wrong_witnesslayout() {
+    let (tx, dl) = new_otx_prefix_tx();
+    let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> = tx.witnesses().into_iter().collect();
+    ws[0] = {
+        let mut data = ws[0].as_slice().to_vec();
+        data[..32].copy_from_slice(&[0u8; 32]);
+
+        data.pack()
+    };
+    let tx = tx.as_advanced_builder().set_witnesses(ws).build();
+
+    let tx = ckb_types::core::cell::resolve_transaction(tx, &mut HashSet::new(), &dl, &dl).unwrap();
+    let verifier = Verifier::default();
+    let err = verifier.verify(&tx, &dl).unwrap_err();
+    assert_script_error(err, 13);
 }
 
 #[test]
@@ -1168,41 +1216,32 @@ fn test_cobuild_otx_prefix_and_suffix() {
     ));
     let tx_builder = tx_builder.output_data(vec![].pack());
 
-    // Append otx
-    let os = schemas::basic::OtxStart::new_builder()
-        .start_cell_deps(1u32.pack())
-        .start_header_deps(0u32.pack())
-        .start_input_cell(1u32.pack())
-        .start_output_cell(1u32.pack())
-        .build();
-    let wl = schemas::top_level::WitnessLayout::new_builder()
-        .set(os)
-        .build();
-    let mut tx_builder = tx_builder.witness(wl.as_bytes().pack());
-    let otxs = vec![
-        generate_otx_a0(&mut dl, &mut px),
-        generate_otx_b0(&mut dl, &mut px),
-    ];
-    for otx in otxs {
-        for e in otx.cell_deps_iter() {
-            tx_builder = tx_builder.cell_dep(e);
-        }
-        for e in otx.header_deps_iter() {
-            tx_builder = tx_builder.header_dep(e);
-        }
-        for e in otx.inputs().into_iter() {
-            tx_builder = tx_builder.input(e);
-        }
-        for e in otx.outputs().into_iter() {
-            tx_builder = tx_builder.output(e);
-        }
-        for e in otx.outputs_data().into_iter() {
-            tx_builder = tx_builder.output_data(e);
-        }
-        for e in otx.witnesses().into_iter() {
-            tx_builder = tx_builder.witness(e);
-        }
-    }
+    let tx_builder = assemble_otx_with_txbuilder(
+        vec![
+            generate_otx_a0(&mut dl, &mut px),
+            generate_otx_b0(&mut dl, &mut px),
+        ],
+        tx_builder,
+    );
+
+    let tx_builder = {
+        let tx = tx_builder.build();
+        let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> =
+            tx.witnesses().into_iter().collect();
+        // Append otx
+        let os = schemas::basic::OtxStart::new_builder()
+            .start_cell_deps(1u32.pack())
+            .start_header_deps(0u32.pack())
+            .start_input_cell(1u32.pack())
+            .start_output_cell(1u32.pack())
+            .build();
+        let wl = schemas::top_level::WitnessLayout::new_builder()
+            .set(os)
+            .build();
+        ws[0] = wl.as_bytes().pack(); // Replace OtxStart
+
+        tx.as_advanced_builder().set_witnesses(ws)
+    };
 
     // Create otx suffix. Add a sighash all only cell for pay fees.
     let prikey = "000000000000000000000000000000000000000000000000000000000000000f";
@@ -1236,7 +1275,14 @@ fn test_cobuild_otx_prefix_and_suffix() {
     let tx = tx_builder.build();
     let tx = ckb_types::core::cell::resolve_transaction(tx, &mut HashSet::new(), &dl, &dl).unwrap();
     let verifier = Verifier::default();
-    verifier.verify(&tx, &dl).unwrap();
+
+    const CONSUME_CYCLES: u64 = 10540000;
+    let cycles = verifier.verify(&tx, &dl).unwrap();
+    println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 150000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
 }
 
 #[test]
@@ -1340,7 +1386,7 @@ fn test_cobuild_otx_random() {
     }
 
     // n success + n failed.
-    //  unknow error code
+    //  unknown error code
     for _ in 0..32 {
         let mut dl = Resource::default();
         let mut px = Pickaxer::default();
