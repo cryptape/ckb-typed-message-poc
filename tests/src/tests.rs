@@ -13,12 +13,15 @@ use ckb_testtool::{
 };
 use ckb_transaction_cobuild::blake2b::new_otx_blake2b;
 use ckb_transaction_cobuild::schemas::{
-    basic::{Action, ActionVec, Message, Otx, OtxStart, ResolvedInputs, SealPair, SealPairVec},
+    basic::{
+        Action, ActionVec, Message, Otx, OtxStart, ResolvedInputs, SealPair, SealPairVec,
+        SighashAll, SighashAllOnly,
+    },
     top_level::{WitnessLayout, WitnessLayoutUnion},
 };
 use molecule::prelude::*;
 
-const MAX_CYCLES: u64 = 10_000_000;
+const MAX_CYCLES: u64 = 20_000_000;
 
 // error numbers
 fn assert_script_error(err: Error, err_code: i8) {
@@ -33,7 +36,28 @@ fn assert_script_error(err: Error, err_code: i8) {
 
 #[test]
 fn test_success_sighash_all() {
-    let others_witnesses = vec![];
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![]);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    // run
+    const CONSUME_CYCLES: u64 = 10000000;
+    let cycles = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect("pass verification");
+    println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 100000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
+}
+
+#[test]
+fn test_success_with_other_witness_than_4() {
+    let others_witnesses = vec![Bytes::from([00, 00, 00, 00].to_vec())];
 
     let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], others_witnesses);
     witnesses.set_with_action(1);
@@ -42,33 +66,155 @@ fn test_success_sighash_all() {
     let (tx, resolved_inputs, context) = gen_tx(&witnesses);
     let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
     // run
-    let cycles = context
+    let _cycles = context
         .verify_tx(&tx, MAX_CYCLES)
         .expect("pass verification");
-    println!("consume cycles: {}", cycles);
 }
 
 #[test]
-fn test_success_sighash_all_only() {
-    let others_witnesses = vec![];
+fn test_success_with_other_empty_witness() {
+    let others_witnesses = vec![Bytes::new()];
 
     let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], others_witnesses);
+    witnesses.set_with_action(1);
 
     // deploy contract
     let (tx, resolved_inputs, context) = gen_tx(&witnesses);
     let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
     // run
+    let _cycles = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect("pass verification");
+}
+
+#[test]
+fn test_failed_append_wrong_witnesslayout() {
+    let other_witness_layout_1 = {
+        let mut data = WitnessLayout::new_builder()
+            .set(WitnessLayoutUnion::SighashAllOnly(
+                SighashAllOnly::new_builder()
+                    .seal(vec![0x12u8; 65].pack())
+                    .build(),
+            ))
+            .build()
+            .as_bytes()
+            .to_vec();
+        data.push(0x10);
+        Bytes::from(data)
+    };
+
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![other_witness_layout_1]);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 13); // parse_witness_layouts verify WitnessLayout
+}
+
+#[test]
+fn test_success_with_other_witnesslayout() {
+    let others_witnesses = vec![WitnessLayout::new_builder()
+        .set(WitnessLayoutUnion::SighashAllOnly(
+            SighashAllOnly::new_builder()
+                .seal(Bytes::from_static(&[0u8; 64]).pack())
+                .build(),
+        ))
+        .build()
+        .as_bytes()];
+
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], others_witnesses);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+    // run
+    const CONSUME_CYCLES: u64 = 10080000;
     let cycles = context
         .verify_tx(&tx, MAX_CYCLES)
         .expect("pass verification");
     println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 100000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
+}
+
+#[test]
+fn test_failed_dup_sighashall() {
+    let others_witnesses = vec![
+        WitnessLayout::new_builder()
+            .set(WitnessLayoutUnion::SighashAllOnly(
+                SighashAllOnly::new_builder()
+                    .seal(Bytes::from_static(&[0u8; 64]).pack())
+                    .build(),
+            ))
+            .build()
+            .as_bytes(),
+        WitnessLayout::new_builder()
+            .set(WitnessLayoutUnion::SighashAll(
+                SighashAll::new_builder()
+                    .message(
+                        Message::new_builder()
+                            .actions(
+                                ActionVec::new_builder()
+                                    .push(
+                                        Action::new_builder()
+                                            .script_hash(Byte32::new([0u8; 32]))
+                                            .build(),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .seal(Bytes::from_static(&[0u8; 64]).pack())
+                    .build(),
+            ))
+            .build()
+            .as_bytes(),
+    ];
+
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], others_witnesses);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 7); // return Error::WrongWitnessLayout
+}
+
+#[test]
+fn test_success_sighash_all_only() {
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![]);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    // run
+    const CONSUME_CYCLES: u64 = 9780000;
+    let cycles = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect("pass verification");
+    println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 100000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
 }
 
 #[test]
 fn test_failed_pubkey() {
-    let others_witnesses = vec![];
-
-    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], others_witnesses);
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![]);
     witnesses.set_with_action(1);
     witnesses.message_data[2].config_failed_pubkey_hash = true;
 
@@ -98,10 +244,15 @@ fn test_type_script() {
 
     let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
     // run
+    const CONSUME_CYCLES: u64 = 10000000;
     let cycles = context
         .verify_tx(&tx, MAX_CYCLES)
         .expect("pass verification");
     println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 100000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
 }
 
 #[test]
@@ -151,8 +302,8 @@ fn test_success_otx() {
             .lock(lock_script.clone())
             .build(),
     ];
-
-    let outputs_data = vec![Bytes::new(); 2];
+    let data: Bytes = vec![0u8; 5000].into();
+    let outputs_data = vec![data, Bytes::new()];
 
     // build transaction
     let tx = TransactionBuilder::default()
@@ -218,10 +369,15 @@ fn test_success_otx() {
         .as_advanced_builder()
         .set_witnesses(vec![witness1, witness2])
         .build();
+    const CONSUME_CYCLES: u64 = 3310000;
     let cycles = context
         .verify_tx(&tx, MAX_CYCLES)
         .expect("pass verification");
     println!("consume cycles: {}", cycles);
+    if cycles > (CONSUME_CYCLES + 100000) {
+        println!("the cycles is: {}", cycles);
+        assert!(false);
+    }
 }
 
 fn generate_otx_signing_message_hash(
@@ -260,4 +416,99 @@ fn generate_otx_signing_message_hash(
     let mut result = [0u8; 32];
     hasher.finalize(&mut result);
     result
+}
+
+#[test]
+fn test_failed_group_witness_not_none() {
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![Bytes::new()]);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    let mut witnesses: Vec<ckb_testtool::ckb_types::packed::Bytes> =
+        tx.witnesses().into_iter().collect();
+    witnesses[1] = ckb_testtool::ckb_types::packed::Bytes::new_builder()
+        .set(vec![Byte::new(0); 4])
+        .build();
+    let tx = tx.as_advanced_builder().set_witnesses(witnesses).build();
+
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 7); // return Error::WrongWitnessLayout
+}
+
+#[test]
+fn test_failed_group_witness_too_long() {
+    let mut witnesses = MessageWitnesses::new(vec![3, 1, 2], vec![Bytes::new()]);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    let mut witnesses: Vec<ckb_testtool::ckb_types::packed::Bytes> =
+        tx.witnesses().into_iter().collect();
+    witnesses[1] = ckb_testtool::ckb_types::packed::Bytes::new_builder()
+        .set(vec![Byte::new(0); 32])
+        .build();
+    let tx = tx.as_advanced_builder().set_witnesses(witnesses).build();
+
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 7); // return Error::WrongWitnessLayout
+}
+
+#[test]
+fn test_success_sighash_all_wrong_sign() {
+    let mut witnesses = MessageWitnesses::new(vec![1, 1], vec![]);
+    witnesses.set_with_action(1);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> = tx.witnesses().into_iter().collect();
+    let mut w0 = ws[0].as_slice().to_vec();
+    let w0_len = w0.len();
+    assert_eq!(w0_len, 85);
+    w0[20..].copy_from_slice(&[0u8; 65]);
+    ws[0] = ckb_testtool::ckb_types::packed::Bytes::from_slice(&w0).unwrap();
+
+    let tx = tx.as_advanced_builder().set_witnesses(ws).build();
+
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 5); // verify failed
+}
+
+#[test]
+fn test_failed_sighash_all_only_wrong_sign() {
+    let mut witnesses = MessageWitnesses::new(vec![1], vec![]);
+
+    // deploy contract
+    let (tx, resolved_inputs, context) = gen_tx(&witnesses);
+    let tx = sign_tx(&mut witnesses, tx, resolved_inputs);
+
+    let mut ws: Vec<ckb_testtool::ckb_types::packed::Bytes> = tx.witnesses().into_iter().collect();
+    let mut w0 = ws[0].as_slice().to_vec();
+    let w0_len = w0.len();
+    assert_eq!(w0_len, 85);
+    w0[20..].copy_from_slice(&[0u8; 65]);
+    ws[0] = ckb_testtool::ckb_types::packed::Bytes::from_slice(&w0).unwrap();
+
+    let tx = tx.as_advanced_builder().set_witnesses(ws).build();
+
+    // run
+    let err = context
+        .verify_tx(&tx, MAX_CYCLES)
+        .expect_err("pass verification");
+    assert_script_error(err, 5); // verify failed
 }
