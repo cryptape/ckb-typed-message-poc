@@ -8,7 +8,7 @@ use blake2b::{new_otx_blake2b, new_sighash_all_blake2b, new_sighash_all_only_bla
 use ckb_gen_types::prelude::Unpack;
 use ckb_std::{
     ckb_constants::Source,
-    ckb_types::packed::{CellInput, Transaction},
+    ckb_types::packed::{BytesVec, CellInput, Transaction},
     error::SysError,
     high_level::{
         self, load_cell, load_cell_data, load_cell_lock_hash, load_tx_hash, load_witness, QueryIter,
@@ -22,7 +22,7 @@ use molecule::{
     NUMBER_SIZE,
 };
 use schemas::{
-    basic::{Message, OtxStart, SealPairVec},
+    basic::{Message, Otx, OtxStart, SealPairVec},
     top_level::{WitnessLayoutReader, WitnessLayoutUnionReader},
 };
 
@@ -169,11 +169,21 @@ pub fn parse_message() -> Result<([u8; 32], Vec<u8>), Error> {
     Ok((signing_message_hash, seal))
 }
 
-/// OtxMessageIter is an iterator over the otx message in current transaction
-/// The item of this iterator is a tuple of signing_message_hash and SealPairVec
-pub struct OtxMessageIter {
-    tx: Transaction,
-    current_script_hash: [u8; 32],
+#[derive(Clone, Debug)]
+pub struct OtxStructure {
+    // TODO: later we might change this field to a lazy reader structure
+    pub otx: Otx,
+    pub witness_index: usize,
+    pub input_cell_start: usize,
+    pub output_cell_start: usize,
+    pub cell_deps_start: usize,
+    pub header_deps_start: usize,
+}
+
+/// OtxStructureIter iterates on fundamental otxs included in current transaction.
+/// Other iterators might also be built on top of OtxStructureIter for handy features.
+pub struct OtxStructureIter {
+    witnesses: BytesVec,
     witness_counter: usize,
     input_cell_counter: usize,
     output_cell_counter: usize,
@@ -181,112 +191,129 @@ pub struct OtxMessageIter {
     header_deps_counter: usize,
 }
 
+impl Iterator for OtxStructureIter {
+    type Item = OtxStructure;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(witness) = self.witnesses.get(self.witness_counter) {
+            if let Ok(r) = WitnessLayoutReader::from_slice(&witness.raw_data()) {
+                if let WitnessLayoutUnionReader::Otx(otx) = r.to_enum() {
+                    let s = OtxStructure {
+                        otx: otx.to_entity(),
+                        witness_index: self.witness_counter,
+                        input_cell_start: self.input_cell_counter,
+                        output_cell_start: self.output_cell_counter,
+                        cell_deps_start: self.cell_deps_counter,
+                        header_deps_start: self.header_deps_counter,
+                    };
+                    self.witness_counter += 1;
+                    let input_cells: u32 = otx.input_cells().unpack();
+                    self.input_cell_counter += input_cells as usize;
+                    let output_cells: u32 = otx.output_cells().unpack();
+                    self.output_cell_counter += output_cells as usize;
+                    let cell_deps: u32 = otx.cell_deps().unpack();
+                    self.cell_deps_counter += cell_deps as usize;
+                    let header_deps: u32 = otx.header_deps().unpack();
+                    self.header_deps_counter += header_deps as usize;
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// OtxMessageIter is an iterator over the otx message in current transaction
+/// The item of this iterator is a tuple of signing_message_hash and SealPairVec
+pub struct OtxMessageIter {
+    tx: Transaction,
+    current_script_hash: [u8; 32],
+    inner_iter: OtxStructureIter,
+}
+
 impl Iterator for OtxMessageIter {
     type Item = ([u8; 32], SealPairVec);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let witness_iter = self.tx.witnesses().into_iter().skip(self.witness_counter);
         let raw_tx = self.tx.raw();
-        for witness in witness_iter {
-            if let Ok(r) = WitnessLayoutReader::from_slice(&witness.raw_data()) {
-                match r.to_enum() {
-                    WitnessLayoutUnionReader::Otx(otx) => {
-                        self.witness_counter += 1;
-                        let input_cells: u32 = otx.input_cells().unpack();
-                        let output_cells: u32 = otx.output_cells().unpack();
-                        let cell_deps: u32 = otx.cell_deps().unpack();
-                        let header_deps: u32 = otx.header_deps().unpack();
-                        let mut input_lock_hash_iter =
-                            QueryIter::new(load_cell_lock_hash, Source::Input)
-                                .skip(self.input_cell_counter)
-                                .take(input_cells as usize);
-                        if input_lock_hash_iter
-                            .any(|lock_hash| lock_hash == self.current_script_hash)
-                        {
-                            let mut hasher = new_otx_blake2b();
-                            // message
-                            hasher.update(otx.message().as_slice());
+        for otx_structure in &mut self.inner_iter {
+            let otx = otx_structure.otx.as_reader();
+            let input_cells: u32 = otx.input_cells().unpack();
+            let output_cells: u32 = otx.output_cells().unpack();
+            let cell_deps: u32 = otx.cell_deps().unpack();
+            let header_deps: u32 = otx.header_deps().unpack();
+            let mut input_lock_hash_iter = QueryIter::new(load_cell_lock_hash, Source::Input)
+                .skip(otx_structure.input_cell_start)
+                .take(input_cells as usize);
+            if input_lock_hash_iter.any(|lock_hash| lock_hash == self.current_script_hash) {
+                let mut hasher = new_otx_blake2b();
+                // message
+                hasher.update(otx.message().as_slice());
 
-                            // otx inputs
-                            hasher.update(&input_cells.to_le_bytes());
-                            let input_iter = raw_tx
-                                .inputs()
-                                .into_iter()
-                                .skip(self.input_cell_counter)
-                                .zip(
-                                    QueryIter::new(load_cell, Source::Input)
-                                        .skip(self.input_cell_counter),
-                                )
-                                .zip(
-                                    QueryIter::new(load_cell_data, Source::Input)
-                                        .skip(self.input_cell_counter),
-                                );
-                            for ((input, input_cell), input_cell_data) in
-                                input_iter.take(input_cells as usize)
-                            {
-                                hasher.update(input.as_slice());
-                                hasher.update(input_cell.as_slice());
-                                hasher.update(&(input_cell_data.len() as u32).to_le_bytes());
-                                hasher.update(&input_cell_data);
-                            }
-                            self.input_cell_counter += input_cells as usize;
-
-                            // otx outputs
-                            hasher.update(&output_cells.to_le_bytes());
-                            let output_iter = raw_tx
-                                .outputs()
-                                .into_iter()
-                                .skip(self.output_cell_counter)
-                                .zip(
-                                    raw_tx
-                                        .outputs_data()
-                                        .into_iter()
-                                        .skip(self.output_cell_counter),
-                                );
-                            for (output_cell, output_cell_data) in
-                                output_iter.take(output_cells as usize)
-                            {
-                                hasher.update(output_cell.as_slice());
-                                // according to the spec, we need to hash the output data length first in little endian, then the data itself.
-                                // we are using molecule serialized slice directly here, it's same as the spec.
-                                hasher.update(output_cell_data.as_slice());
-                            }
-                            self.output_cell_counter += output_cells as usize;
-
-                            // otx cell deps
-                            hasher.update(&cell_deps.to_le_bytes());
-                            let cell_dep_iter =
-                                raw_tx.cell_deps().into_iter().skip(self.cell_deps_counter);
-                            for cell_dep in cell_dep_iter.take(cell_deps as usize) {
-                                hasher.update(cell_dep.as_slice());
-                            }
-                            self.cell_deps_counter += cell_deps as usize;
-
-                            // otx header deps
-                            hasher.update(&header_deps.to_le_bytes());
-                            let header_dep_iter = raw_tx
-                                .header_deps()
-                                .into_iter()
-                                .skip(self.header_deps_counter);
-                            for header_dep in header_dep_iter.take(header_deps as usize) {
-                                hasher.update(header_dep.as_slice());
-                            }
-                            self.header_deps_counter += header_deps as usize;
-
-                            let mut result = [0u8; 32];
-                            hasher.finalize(&mut result);
-                            return Some((result, otx.seals().to_entity()));
-                        } else {
-                            self.input_cell_counter += input_cells as usize;
-                            self.output_cell_counter += output_cells as usize;
-                            self.cell_deps_counter += cell_deps as usize;
-                            self.header_deps_counter += header_deps as usize;
-                        }
-                    }
-                    _ => return None,
+                // otx inputs
+                hasher.update(&input_cells.to_le_bytes());
+                let input_iter = raw_tx
+                    .inputs()
+                    .into_iter()
+                    .skip(otx_structure.input_cell_start)
+                    .zip(
+                        QueryIter::new(load_cell, Source::Input)
+                            .skip(otx_structure.input_cell_start),
+                    )
+                    .zip(
+                        QueryIter::new(load_cell_data, Source::Input)
+                            .skip(otx_structure.input_cell_start),
+                    );
+                for ((input, input_cell), input_cell_data) in input_iter.take(input_cells as usize)
+                {
+                    hasher.update(input.as_slice());
+                    hasher.update(input_cell.as_slice());
+                    hasher.update(&(input_cell_data.len() as u32).to_le_bytes());
+                    hasher.update(&input_cell_data);
                 }
-            } else {
-                return None;
+
+                // otx outputs
+                hasher.update(&output_cells.to_le_bytes());
+                let output_iter = raw_tx
+                    .outputs()
+                    .into_iter()
+                    .skip(otx_structure.output_cell_start)
+                    .zip(
+                        raw_tx
+                            .outputs_data()
+                            .into_iter()
+                            .skip(otx_structure.output_cell_start),
+                    );
+                for (output_cell, output_cell_data) in output_iter.take(output_cells as usize) {
+                    hasher.update(output_cell.as_slice());
+                    // according to the spec, we need to hash the output data length first in little endian, then the data itself.
+                    // we are using molecule serialized slice directly here, it's same as the spec.
+                    hasher.update(output_cell_data.as_slice());
+                }
+
+                // otx cell deps
+                hasher.update(&cell_deps.to_le_bytes());
+                let cell_dep_iter = raw_tx
+                    .cell_deps()
+                    .into_iter()
+                    .skip(otx_structure.cell_deps_start);
+                for cell_dep in cell_dep_iter.take(cell_deps as usize) {
+                    hasher.update(cell_dep.as_slice());
+                }
+
+                // otx header deps
+                hasher.update(&header_deps.to_le_bytes());
+                let header_dep_iter = raw_tx
+                    .header_deps()
+                    .into_iter()
+                    .skip(otx_structure.header_deps_start);
+                for header_dep in header_dep_iter.take(header_deps as usize) {
+                    hasher.update(header_dep.as_slice());
+                }
+
+                let mut result = [0u8; 32];
+                hasher.finalize(&mut result);
+                return Some((result, otx.seals().to_entity()));
             }
         }
 
@@ -319,6 +346,22 @@ pub fn verify_otx_message<F: Fn(&[u8], &[u8; 32]) -> bool>(
 /// This function is mainly used by lock script
 ///
 pub fn parse_otx_message(current_script_hash: [u8; 32]) -> Result<OtxMessageIter, Error> {
+    let (inner_iter, tx) = parse_otx_structure()?;
+
+    Ok(OtxMessageIter {
+        tx,
+        current_script_hash,
+        inner_iter,
+    })
+}
+
+///
+/// parse transaction and return `OtxStructureIter`
+///
+/// TODO: we should really revisit the code here, so we are return a lazy loader
+/// of the transaction, not the full transaction always.
+///
+pub fn parse_otx_structure() -> Result<(OtxStructureIter, Transaction), Error> {
     let (otx_start, start_index) = fetch_otx_start()?;
     let start_input_cell: u32 = otx_start.start_input_cell().unpack();
     let start_output_cell: u32 = otx_start.start_output_cell().unpack();
@@ -327,15 +370,17 @@ pub fn parse_otx_message(current_script_hash: [u8; 32]) -> Result<OtxMessageIter
 
     let tx = high_level::load_transaction()?;
 
-    Ok(OtxMessageIter {
+    Ok((
+        OtxStructureIter {
+            witnesses: tx.witnesses(),
+            witness_counter: start_index + 1,
+            input_cell_counter: start_input_cell as usize,
+            output_cell_counter: start_output_cell as usize,
+            cell_deps_counter: start_cell_deps as usize,
+            header_deps_counter: start_header_deps as usize,
+        },
         tx,
-        current_script_hash,
-        witness_counter: start_index + 1,
-        input_cell_counter: start_input_cell as usize,
-        output_cell_counter: start_output_cell as usize,
-        cell_deps_counter: start_cell_deps as usize,
-        header_deps_counter: start_header_deps as usize,
-    })
+    ))
 }
 
 fn fetch_otx_start() -> Result<(OtxStart, usize), Error> {
